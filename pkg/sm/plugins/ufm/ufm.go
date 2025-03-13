@@ -1,12 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
 
-	"github.com/caarlos0/env/v6"
+	"github.com/caarlos0/env/v11"
 	"github.com/rs/zerolog/log"
 
 	httpDriver "github.com/Mellanox/ib-kubernetes/pkg/drivers/http"
@@ -65,10 +66,12 @@ func newUfmPlugin() (*ufmPlugin, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create http client err: %v", err)
 	}
-	return &ufmPlugin{PluginName: pluginName,
+	return &ufmPlugin{
+		PluginName:  pluginName,
 		SpecVersion: specVersion,
 		conf:        ufmConf,
-		client:      client}, nil
+		client:      client,
+	}, nil
 }
 
 func (u *ufmPlugin) Name() string {
@@ -81,7 +84,6 @@ func (u *ufmPlugin) Spec() string {
 
 func (u *ufmPlugin) Validate() error {
 	_, err := u.client.Get(u.buildURL("/ufmRest/app/ufm_version"), http.StatusOK)
-
 	if err != nil {
 		return fmt.Errorf("failed to connect to ufm subnet manager: %v", err)
 	}
@@ -131,6 +133,48 @@ func (u *ufmPlugin) RemoveGuidsFromPKey(pKey int, guids []net.HardwareAddr) erro
 	}
 
 	return nil
+}
+
+// convertToMacAddr adds semicolons each 2 characters to convert to MAC format
+// UFM returns GUIDS without any delimiters, so expected format is as follows:
+// FF00FF00FF00FF00
+func convertToMacAddr(guid string) string {
+	for i := 2; i < len(guid); i += 3 {
+		guid = guid[:i] + ":" + guid[i:]
+	}
+	return guid
+}
+
+type GUID struct {
+	GUIDValue string `json:"guid"`
+}
+
+type PKey struct {
+	Guids []GUID `json:"guids"`
+}
+
+// ListGuidsInUse returns all guids currently in use by pKeys
+func (u *ufmPlugin) ListGuidsInUse() ([]string, error) {
+	response, err := u.client.Get(u.buildURL("/ufmRest/resources/pkeys/?guids_data=true"), http.StatusOK)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get the list of guids: %v", err)
+	}
+
+	var pKeys map[string]PKey
+
+	if err := json.Unmarshal(response, &pKeys); err != nil {
+		return nil, fmt.Errorf("failed to get the list of guids: %v", err)
+	}
+
+	var guids []string
+
+	for pkey := range pKeys {
+		pkeyData := pKeys[pkey]
+		for _, guidData := range pkeyData.Guids {
+			guids = append(guids, convertToMacAddr(guidData.GUIDValue))
+		}
+	}
+	return guids, nil
 }
 
 func (u *ufmPlugin) buildURL(path string) string {

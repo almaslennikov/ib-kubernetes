@@ -90,12 +90,6 @@ func NewDaemon() (Daemon, error) {
 
 	podEventHandler := resEvenHandler.NewPodEventHandler()
 	client, err := k8sClient.NewK8sClient()
-
-	if err != nil {
-		return nil, err
-	}
-
-	guidPool, err := guid.NewPool(&daemonConfig.GUIDPool)
 	if err != nil {
 		return nil, err
 	}
@@ -125,6 +119,17 @@ func NewDaemon() (Daemon, error) {
 		return nil, validateErr
 	}
 
+	guidPool, err := guid.NewPool(&daemonConfig.GUIDPool)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reset guid pool with already allocated guids to avoid collisions
+	err = syncGUIDPool(smClient, guidPool)
+	if err != nil {
+		return nil, err
+	}
+
 	podWatcher := watcher.NewWatcher(podEventHandler, client)
 	return &daemon{
 		config:            daemonConfig,
@@ -132,7 +137,8 @@ func NewDaemon() (Daemon, error) {
 		kubeClient:        client,
 		guidPool:          guidPool,
 		smClient:          smClient,
-		guidPodNetworkMap: make(map[string]string)}, nil
+		guidPodNetworkMap: make(map[string]string),
+	}, nil
 }
 
 func (d *daemon) Run() {
@@ -163,6 +169,8 @@ func (d *daemon) Run() {
 }
 
 // If network identified by networkID is IbSriov return network name and spec
+//
+//nolint:nilerr
 func (d *daemon) getIbSriovNetwork(networkID string) (string, *utils.IbSriovCniSpec, error) {
 	networkNamespace, networkName, err := utils.ParseNetworkID(networkID)
 	if err != nil {
@@ -218,7 +226,8 @@ func getPodNetworkInfo(netName string, pod *kapi.Pod, netMap networksMap) (*podN
 	return &podNetworkInfo{
 		pod:       pod,
 		networks:  networks,
-		ibNetwork: network}, nil
+		ibNetwork: network,
+	}, nil
 }
 
 // Verify if GUID already exist for given network ID and allocates new one if not
@@ -256,7 +265,16 @@ func (d *daemon) processNetworkGUID(networkID string, spec *utils.IbSriovCniSpec
 	} else {
 		guidAddr, err = d.guidPool.GenerateGUID()
 		if err != nil {
-			return fmt.Errorf("failed to generate GUID for pod ID %s, with error: %v", pi.pod.UID, err)
+			switch err {
+			// If the guid pool is exhausted, need to sync with SM in case there are unsynced changes
+			case guid.ErrGUIDPoolExhausted:
+				err = syncGUIDPool(d.smClient, d.guidPool)
+				if err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("failed to generate GUID for pod ID %s, with error: %v", pi.pod.UID, err)
+			}
 		}
 
 		allocatedGUID = guidAddr.String()
@@ -281,6 +299,20 @@ func (d *daemon) processNetworkGUID(networkID string, spec *utils.IbSriovCniSpec
 
 	// used GUID as net.HardwareAddress to use it in sm plugin which receive []net.HardwareAddress as parameter
 	pi.addr = guidAddr.HardWareAddress()
+	return nil
+}
+
+func syncGUIDPool(smClient plugins.SubnetManagerClient, guidPool guid.Pool) error {
+	usedGuids, err := smClient.ListGuidsInUse()
+	if err != nil {
+		return err
+	}
+
+	// Reset guid pool with already allocated guids to avoid collisions
+	err = guidPool.Reset(usedGuids)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -327,6 +359,7 @@ func (d *daemon) updatePodNetworkAnnotation(pi *podNetworkInfo, removedList *[]n
 	return nil
 }
 
+//nolint:nilerr
 func (d *daemon) AddPeriodicUpdate() {
 	log.Info().Msgf("running periodic add update")
 	addMap, _ := d.watcher.GetHandler().GetResults()
@@ -462,6 +495,7 @@ func getPodGUIDForNetwork(pod *kapi.Pod, networkName string) (net.HardwareAddr, 
 	return guidAddr, nil
 }
 
+//nolint:nilerr
 func (d *daemon) DeletePeriodicUpdate() {
 	log.Info().Msg("running delete periodic update")
 	_, deleteMap := d.watcher.GetHandler().GetResults()
@@ -537,7 +571,7 @@ func (d *daemon) DeletePeriodicUpdate() {
 	log.Info().Msg("delete periodic update finished")
 }
 
-//  initPool check the guids that are already allocated by the running pods
+// initPool check the guids that are already allocated by the running pods
 func (d *daemon) initPool() error {
 	log.Info().Msg("Initializing GUID pool.")
 
